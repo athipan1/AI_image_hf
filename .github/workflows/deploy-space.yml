@@ -22,6 +22,11 @@ jobs:
           ref: main
           fetch-depth: 0
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Validate Hugging Face token
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -30,6 +35,28 @@ jobs:
             echo "HF_TOKEN GitHub Actions secret is not configured."
             exit 1
           fi
+
+      - name: Configure Space runtime secret
+        env:
+          HF_DEPLOY_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_RUNTIME_TOKEN: ${{ secrets.HF_INFERENCE_TOKEN || secrets.HF_TOKEN }}
+        run: |
+          pip install "huggingface_hub>=0.34,<1"
+          python - <<'PY'
+          import os
+          from huggingface_hub import HfApi
+
+          deploy_token = os.environ["HF_DEPLOY_TOKEN"]
+          runtime_token = os.environ["HF_RUNTIME_TOKEN"]
+          api = HfApi(token=deploy_token)
+          api.add_space_secret(
+              repo_id="Athipan01/AI_image",
+              key="HF_TOKEN",
+              value=runtime_token,
+              description="Inference token managed by AI_image_hf GitHub Actions",
+          )
+          print("Configured HF_TOKEN secret for Athipan01/AI_image")
+          PY
 
       - name: Sync repository to Hugging Face Space
         env:
