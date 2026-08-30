@@ -7,7 +7,7 @@ sdk: gradio
 app_file: app.py
 pinned: false
 license: mit
-short_description: Serverless text-to-image generator using Hugging Face Inference Providers
+short_description: Serverless text-to-image with Hugging Face providers
 ---
 
 # Athipan01 AI Image Generator
@@ -25,10 +25,9 @@ The app does not run a local GPU model. It uses Hugging Face Inference Providers
 Configure these in GitHub Actions secrets:
 
 - `HF_TOKEN`: Hugging Face token with write access to the target Space.
+- Optional `HF_INFERENCE_TOKEN`: a narrower inference-only token. If omitted, deployment uses `HF_TOKEN` as the Space runtime token.
 
-Configure this in the Hugging Face Space secrets:
-
-- `HF_TOKEN`: Hugging Face token with inference permission.
+The deployment workflow securely creates/updates the Space secret named `HF_TOKEN`; no token value is committed to Git.
 
 Optional Space variable:
 
@@ -45,7 +44,7 @@ python app.py
 
 ## Deployment
 
-Pushes to `main` run tests and, when `HF_TOKEN` is available in GitHub Actions, sync the application files to `Athipan01/AI_image`.
+Pushes to `main` run tests. A successful test run triggers deployment to `Athipan01/AI_image`, configures the runtime secret, and synchronizes the repository to Hugging Face.
 
 ## Roadmap
 
