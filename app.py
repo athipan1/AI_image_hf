@@ -13,9 +13,9 @@ if not HF_TOKEN:
 DEFAULT_MODEL = os.getenv("IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")
 MODEL_ROUTES = {
     "general": os.getenv("IMAGE_MODEL_GENERAL", DEFAULT_MODEL),
-    "photo": os.getenv("IMAGE_MODEL_PHOTO", DEFAULT_MODEL),
-    "anime": os.getenv("IMAGE_MODEL_ANIME", DEFAULT_MODEL),
-    "design": os.getenv("IMAGE_MODEL_DESIGN", DEFAULT_MODEL),
+    "photo": os.getenv("IMAGE_MODEL_PHOTO", "black-forest-labs/FLUX.1-Krea-dev"),
+    "anime": os.getenv("IMAGE_MODEL_ANIME", "falanaja/animefal"),
+    "design": os.getenv("IMAGE_MODEL_DESIGN", "Qwen/Qwen-Image"),
 }
 
 STYLE_PRESETS = {
@@ -67,6 +67,24 @@ def _normalise_seed(seed):
 
 def _normalise_space(text):
     return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _is_credit_error(exc):
+    text = str(exc).lower()
+    return "402" in text or "payment required" in text or "depleted" in text and "credits" in text
+
+
+def _model_candidates(route, selected_model):
+    candidates = [selected_model]
+    if route != "general" and DEFAULT_MODEL not in candidates:
+        candidates.append(DEFAULT_MODEL)
+    return candidates
+
+
+def _adapt_prompt_for_model(prompt, model):
+    if model == "falanaja/animefal" and "animefal" not in prompt.lower():
+        return f"animefal, {prompt}"
+    return prompt
 
 
 def route_model(prompt, style="Auto"):
@@ -159,8 +177,61 @@ def preview_prompt(prompt, negative_prompt, style, auto_enhance):
     final_prompt, final_negative, route, model = prepare_generation(
         prompt, negative_prompt, style, auto_enhance
     )
-    info = f"Router: `{route}` · Model: `{model}`"
+    fallback = "" if model == DEFAULT_MODEL else f" · Fallback: `{DEFAULT_MODEL}`"
+    info = f"Router: `{route}` · Primary: `{model}`{fallback}"
     return final_prompt, final_negative, info
+
+
+def _request_image(model, prompt, negative_prompt, width, height, steps, guidance, seed):
+    adapted_prompt = _adapt_prompt_for_model(prompt, model)
+    try:
+        return client.text_to_image(
+            prompt=adapted_prompt,
+            model=model,
+            negative_prompt=negative_prompt or None,
+            width=int(width),
+            height=int(height),
+            num_inference_steps=int(steps),
+            guidance_scale=float(guidance),
+            seed=seed,
+        )
+    except TypeError:
+        return client.text_to_image(
+            prompt=adapted_prompt,
+            model=model,
+            negative_prompt=negative_prompt or None,
+            seed=seed,
+        )
+
+
+def _generate_with_fallback(route, selected_model, prompt, negative_prompt, width, height, steps, guidance, seed):
+    attempts = []
+    for model in _model_candidates(route, selected_model):
+        started = time.perf_counter()
+        try:
+            image = _request_image(
+                model, prompt, negative_prompt, width, height, steps, guidance, seed
+            )
+            attempts.append({"model": model, "success": True, "seconds": time.perf_counter() - started})
+            return image, model, attempts
+        except Exception as exc:
+            attempts.append(
+                {
+                    "model": model,
+                    "success": False,
+                    "seconds": time.perf_counter() - started,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            if _is_credit_error(exc):
+                raise gr.Error(
+                    "Hugging Face Inference Provider credits are depleted. Add prepaid credits, wait for the monthly reset, or use another funded provider account."
+                ) from exc
+
+    compact_errors = " | ".join(
+        f"{item['model']}: {item.get('error', 'unknown error')}" for item in attempts if not item["success"]
+    )
+    raise gr.Error(f"All model routes failed. {compact_errors}")
 
 
 def generate_image(
@@ -174,37 +245,30 @@ def generate_image(
     guidance,
     seed,
 ):
-    final_prompt, final_negative, route, model = prepare_generation(
+    final_prompt, final_negative, route, selected_model = prepare_generation(
         prompt, negative_prompt, style, auto_enhance
     )
     seed = _normalise_seed(seed)
     started = time.perf_counter()
 
-    try:
-        image = client.text_to_image(
-            prompt=final_prompt,
-            model=model,
-            negative_prompt=final_negative or None,
-            width=int(width),
-            height=int(height),
-            num_inference_steps=int(steps),
-            guidance_scale=float(guidance),
-            seed=seed,
-        )
-    except TypeError:
-        image = client.text_to_image(
-            prompt=final_prompt,
-            model=model,
-            negative_prompt=final_negative or None,
-            seed=seed,
-        )
-    except Exception as exc:
-        raise gr.Error(f"Image generation failed: {exc}") from exc
+    image, actual_model, attempts = _generate_with_fallback(
+        route,
+        selected_model,
+        final_prompt,
+        final_negative,
+        width,
+        height,
+        steps,
+        guidance,
+        seed,
+    )
 
     elapsed = round(time.perf_counter() - started, 2)
+    used_fallback = actual_model != selected_model
+    fallback_note = f" · Fallback used from `{selected_model}`" if used_fallback else ""
     metadata = (
-        f"Route: `{route}` · Model: `{model}` · Style: `{style}` · "
-        f"Seed: `{seed}` · Time: `{elapsed}s`"
+        f"Route: `{route}` · Model: `{actual_model}`{fallback_note} · Style: `{style}` · "
+        f"Seed: `{seed}` · Time: `{elapsed}s` · Attempts: `{len(attempts)}`"
     )
     return image, metadata, final_prompt, final_negative
 
@@ -226,7 +290,7 @@ with gr.Blocks(css=CSS, title="Athipan01 AI Image Generator") as demo:
         """
         <div id="hero">
           <h1>🎨 Athipan01 AI Image Generator</h1>
-          <p>Prompt Intelligence + automatic model routing + Hugging Face Inference Providers</p>
+          <p>Prompt Intelligence + specialist model routing + safe provider fallback</p>
         </div>
         """
     )
