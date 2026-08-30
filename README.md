@@ -7,7 +7,7 @@ sdk: gradio
 app_file: app.py
 pinned: false
 license: mit
-short_description: Smart text-to-image with Hugging Face providers
+short_description: ZeroGPU-first smart image generator
 ---
 
 # Athipan01 AI Image Generator
@@ -16,44 +16,38 @@ GitHub is the source of truth for the Hugging Face Space `Athipan01/AI_image`.
 
 ## Current architecture
 
-`Gradio UI -> Prompt Intelligence -> Model Router -> specialist model -> safe fallback -> Hugging Face Inference Providers`
+`Gradio UI -> Prompt Intelligence -> ZeroGPU local SDXL Turbo -> Inference Provider fallback`
 
-The Space does not load a large diffusion model locally. Generation is routed through Hugging Face Inference Providers.
+The primary backend is now Hugging Face ZeroGPU. The Space loads `stabilityai/sdxl-turbo` locally with Diffusers and runs generation inside `@spaces.GPU(duration=45)`. Hugging Face Inference Providers are used only if the local model fails to load or local inference fails.
 
-## Phase 1: Prompt Intelligence
-
-The first intelligence layer includes automatic prompt enhancement, style presets, automatic negative prompts, Thai/English intent routing, and a prompt preview showing what is sent to the selected model.
-
-## Phase 1.5: Specialist models and real benchmark
-
-Default routes now use specialist models:
+ZeroGPU defaults are optimized for interactive generation:
 
 ```text
-General -> black-forest-labs/FLUX.1-schnell
-Photo   -> black-forest-labs/FLUX.1-Krea-dev
-Anime   -> falanaja/animefal
-Design  -> Qwen/Qwen-Image
+Local model: stabilityai/sdxl-turbo
+Resolution: 512x512 by default
+Steps: 2 by default, capped at 4 on the local Turbo path
+Guidance: 0.0 on the local Turbo path
 ```
 
-All specialist routes fall back to `black-forest-labs/FLUX.1-schnell` when a specialist is unavailable or incompatible. A 402 / depleted-credit response is fail-fast and does not waste another provider call.
+SDXL Turbo is intentionally used as the first local model because it is designed for very low step counts. Higher 768/1024 resolutions remain selectable, but 512x512 is the preferred quality/speed point.
 
-The photo route was tested with real Inference Provider calls at 768x768 and a fixed seed. `FLUX.1-Krea-dev` completed in about 3.36 seconds versus about 3.83 seconds for `FLUX.1-schnell`. Visual review showed the Krea result had more natural skin/material rendering, while the Schnell result looked more synthetic. The benchmark's technical `visual_signal_score` is only a contrast/edge sanity proxy and is not treated as an aesthetic score.
+## Prompt Intelligence and provider fallback
 
-The same benchmark attempted Anime and Design, but the Hugging Face account depleted its included Inference Provider credits after the first two successful photo calls. `cagliostrolab/animagine-xl-4.0` was also rejected by automatic provider routing, so the Anime candidate was changed to `falanaja/animefal`, which exposes Hugging Face Inference Provider support through fal. `Qwen/Qwen-Image` remains the Design specialist because Hugging Face lists it as a recommended text-to-image model and it is exposed through Inference Providers.
-
-Run the benchmark again after credits reset or prepaid credits are added:
+Prompt enhancement, style presets, automatic negative prompts and Thai/English intent routing remain active. Intent routing now selects the provider fallback model rather than the primary backend:
 
 ```text
-Actions -> Benchmark Image Models -> Run workflow
+General fallback -> black-forest-labs/FLUX.1-schnell
+Photo fallback   -> black-forest-labs/FLUX.1-Krea-dev
+Anime fallback   -> falanaja/animefal
+Design fallback  -> Qwen/Qwen-Image
 ```
 
-The workflow stores PNG outputs plus `benchmark.json` and `benchmark.md` as the `phase-1-5-model-benchmark` artifact. A credit-blocked benchmark reports `blocked_by_credits` without turning the workflow red.
+This means normal successful requests consume ZeroGPU quota instead of Inference Provider credits. Provider credits are consumed only when the local ZeroGPU path cannot complete the request.
 
 ## Model overrides
 
-Every route can still be replaced without changing code:
-
 ```text
+LOCAL_IMAGE_MODEL=stabilityai/sdxl-turbo
 IMAGE_MODEL=black-forest-labs/FLUX.1-schnell
 IMAGE_MODEL_GENERAL=black-forest-labs/FLUX.1-schnell
 IMAGE_MODEL_PHOTO=black-forest-labs/FLUX.1-Krea-dev
@@ -61,28 +55,21 @@ IMAGE_MODEL_ANIME=falanaja/animefal
 IMAGE_MODEL_DESIGN=Qwen/Qwen-Image
 ```
 
+## Dependencies
+
+Hugging Face manages `gradio`, `spaces`, `huggingface_hub` and the ZeroGPU-compatible PyTorch runtime. The repository installs only application dependencies such as Diffusers, Transformers, Accelerate, Safetensors and Pillow.
+
 ## Required secrets
 
-Configure in GitHub Actions secrets:
+- `HF_TOKEN`: deployment token and provider fallback token.
+- Optional `HF_INFERENCE_TOKEN`: narrower runtime token for provider fallback.
 
-- `HF_TOKEN`: Hugging Face token with write access to the target Space and Inference Providers permission.
-- Optional `HF_INFERENCE_TOKEN`: a narrower runtime inference token. If omitted, deployment uses `HF_TOKEN` as the Space runtime token.
-
-The deployment workflow creates or updates the Space secret named `HF_TOKEN`; token values are never committed to Git.
-
-## Local development
-
-```bash
-python -m venv .venv
-pip install -r requirements.txt
-export HF_TOKEN=hf_xxx
-python app.py
-```
+The deployment workflow writes the runtime `HF_TOKEN` into the Space secret store. No token value is committed to Git.
 
 ## Deployment
 
-Pushes to `main` run tests. A successful test run triggers deployment to `Athipan01/AI_image`, configures the runtime secret, and synchronizes the repository to Hugging Face.
+Pushes to `main` run tests. A successful test run triggers deployment to `Athipan01/AI_image`.
 
-## Next phases
+## Roadmap
 
-Phase 2 will focus on image editing: image-to-image, inpainting, upscale and background removal. Phase 3 will add LoRA and character/style consistency. Phase 4 will add generation history, favorites, richer quality evaluation, provider observability and production metrics.
+Phase 2 will add image-to-image, inpainting, upscale and background removal. Phase 3 will add LoRA and character/style consistency. Later phases will add history, quality evaluation, observability and smarter model promotion.
