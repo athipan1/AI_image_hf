@@ -3,6 +3,18 @@ import random
 import re
 import time
 
+try:
+    import spaces
+except ImportError:  # Local/CI fallback; Hugging Face Spaces provides this package.
+    class _SpacesFallback:
+        @staticmethod
+        def GPU(func=None, **kwargs):
+            if func is not None:
+                return func
+            return lambda wrapped: wrapped
+
+    spaces = _SpacesFallback()
+
 import gradio as gr
 from huggingface_hub import InferenceClient
 
@@ -57,6 +69,18 @@ BASE_NEGATIVE = [
 ]
 
 client = InferenceClient(provider="auto", api_key=HF_TOKEN)
+
+
+@spaces.GPU(duration=1)
+def _zerogpu_startup_probe():
+    """Module-level ZeroGPU marker.
+
+    Image generation is performed by Hugging Face Inference Providers, so this
+    function is intentionally never invoked. Its presence lets a Space that was
+    configured for ZeroGPU boot without unnecessarily reserving a GPU for remote
+    inference requests.
+    """
+    return True
 
 
 def _normalise_seed(seed):
@@ -285,7 +309,7 @@ CSS = """
 .preview-box textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 """
 
-with gr.Blocks(css=CSS, title="Athipan01 AI Image Generator") as demo:
+with gr.Blocks(title="Athipan01 AI Image Generator") as demo:
     gr.Markdown(
         """
         <div id="hero">
@@ -392,4 +416,4 @@ with gr.Blocks(css=CSS, title="Athipan01 AI Image Generator") as demo:
     )
 
 if __name__ == "__main__":
-    demo.queue(default_concurrency_limit=1).launch()
+    demo.queue(default_concurrency_limit=1).launch(css=CSS)
