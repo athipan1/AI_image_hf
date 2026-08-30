@@ -1,1 +1,59 @@
-placeholder
+name: Benchmark Image Models
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/benchmark_models.py'
+      - '.github/workflows/benchmark-models.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install benchmark dependencies
+        run: pip install 'huggingface_hub>=0.34,<1' 'Pillow>=11,<12'
+
+      - name: Validate Hugging Face token
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "HF_TOKEN is required for real inference benchmarking."
+            exit 1
+          fi
+
+      - name: Run real model benchmark
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python scripts/benchmark_models.py
+
+      - name: Publish benchmark summary
+        if: always()
+        run: |
+          if [ -f benchmark-results/benchmark.md ]; then
+            cat benchmark-results/benchmark.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload benchmark images and report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase-1-5-model-benchmark
+          path: benchmark-results/
+          if-no-files-found: warn
+          retention-days: 14
