@@ -1,1 +1,5 @@
 Pillow>=11,<12
+diffusers>=0.35,<1
+transformers>=4.49,<6
+accelerate>=1.2,<2
+safetensors>=0.5,<1
