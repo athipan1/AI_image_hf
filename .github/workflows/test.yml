@@ -27,4 +27,5 @@ jobs:
       - name: Run tests
         env:
           HF_TOKEN: test-token
+          PYTHONPATH: ${{ github.workspace }}
         run: pytest -q
