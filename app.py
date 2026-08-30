@@ -5,46 +5,24 @@ import time
 
 try:
     import spaces
-except ImportError:  # Local/CI fallback. Hugging Face ZeroGPU provides this package.
+except ImportError:
     class _SpacesFallback:
         @staticmethod
         def GPU(func=None, **kwargs):
             if func is not None:
                 return func
             return lambda wrapped: wrapped
-
     spaces = _SpacesFallback()
 
 import gradio as gr
 from huggingface_hub import InferenceClient
+from PIL import Image, ImageFilter
 
 HF_TOKEN = os.getenv("HF_TOKEN")
 IS_HF_SPACE = bool(os.getenv("SPACE_ID"))
 
-# ZeroGPU primary backend. SDXL Turbo is intentionally lightweight and fast enough
-# for interactive ZeroGPU use. It is optimized for 512x512 and 1-4 inference steps.
-LOCAL_MODEL = os.getenv("LOCAL_IMAGE_MODEL", "stabilityai/sdxl-turbo")
-LOCAL_PIPELINE = None
-LOCAL_LOAD_ERROR = None
-_torch = None
-
-if IS_HF_SPACE:
-    try:
-        import torch as _torch_module
-        from diffusers import AutoPipelineForText2Image
-
-        _torch = _torch_module
-        LOCAL_PIPELINE = AutoPipelineForText2Image.from_pretrained(
-            LOCAL_MODEL,
-            torch_dtype=_torch.float16,
-            variant="fp16",
-        ).to("cuda")
-        LOCAL_PIPELINE.set_progress_bar_config(disable=True)
-    except Exception as exc:  # Keep the UI alive so provider fallback can still work.
-        LOCAL_LOAD_ERROR = f"{type(exc).__name__}: {exc}"
-        LOCAL_PIPELINE = None
-
-# Provider backend is now fallback only.
+FAST_MODEL = os.getenv("LOCAL_FAST_MODEL", "stabilityai/sdxl-turbo")
+QUALITY_MODEL = os.getenv("LOCAL_QUALITY_MODEL", "ByteDance/SDXL-Lightning")
 DEFAULT_PROVIDER_MODEL = os.getenv("IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")
 MODEL_ROUTES = {
     "general": os.getenv("IMAGE_MODEL_GENERAL", DEFAULT_PROVIDER_MODEL),
@@ -55,43 +33,21 @@ MODEL_ROUTES = {
 
 STYLE_PRESETS = {
     "Auto": "",
-    "Photorealistic": (
-        "photorealistic, natural skin texture, realistic materials, physically plausible lighting, "
-        "high dynamic range, professional photography"
-    ),
-    "Cinematic": (
-        "cinematic composition, dramatic lighting, volumetric atmosphere, film still, "
-        "high detail, strong visual storytelling"
-    ),
-    "Anime": (
-        "anime illustration, clean line art, expressive character design, polished cel shading, "
-        "detailed background"
-    ),
-    "Concept Art": (
-        "professional concept art, strong silhouette, atmospheric perspective, detailed environment, "
-        "production design"
-    ),
-    "Product / Logo": (
-        "clean commercial design, centered composition, controlled lighting, crisp edges, "
-        "minimal visual clutter"
-    ),
+    "Photorealistic": "photorealistic, natural skin texture, realistic materials, professional photography",
+    "Cinematic": "cinematic composition, dramatic lighting, volumetric atmosphere, film still, high detail",
+    "Anime": "anime illustration, clean line art, expressive character design, polished cel shading",
+    "Concept Art": "professional concept art, strong silhouette, atmospheric perspective, production design",
+    "Product / Logo": "clean commercial design, centered composition, crisp edges, minimal visual clutter",
 }
-
 BASE_NEGATIVE = [
-    "low quality",
-    "blurry",
-    "pixelated",
-    "distorted",
-    "deformed",
-    "bad anatomy",
-    "extra fingers",
-    "extra limbs",
-    "duplicate subject",
-    "watermark",
-    "unwanted text",
+    "low quality", "blurry", "pixelated", "distorted", "deformed", "bad anatomy",
+    "extra fingers", "extra limbs", "duplicate subject", "watermark", "unwanted text",
 ]
 
 provider_client = InferenceClient(provider="auto", api_key=HF_TOKEN) if HF_TOKEN else None
+_torch = None
+_PIPELINES = {}
+_PIPELINE_ERRORS = {}
 
 
 def _normalise_seed(seed):
@@ -109,83 +65,51 @@ def _is_credit_error(exc):
     return "402" in text or "payment required" in text or ("depleted" in text and "credits" in text)
 
 
-def _adapt_prompt_for_model(prompt, model):
-    if model == "falanaja/animefal" and "animefal" not in prompt.lower():
-        return f"animefal, {prompt}"
-    return prompt
-
-
 def route_model(prompt, style="Auto"):
-    """Choose the provider fallback route from the user's intent."""
     text = f"{prompt or ''} {style or ''}".lower()
-
-    anime_terms = ("anime", "manga", "waifu", "cel shading", "อนิเมะ", "มังงะ")
-    design_terms = ("logo", "brand mark", "icon", "product shot", "packaging", "โลโก้")
-    photo_terms = (
-        "photo",
-        "photoreal",
-        "portrait",
-        "camera",
-        "lens",
-        "photography",
-        "ภาพถ่าย",
-        "สมจริง",
-    )
-
-    if any(term in text for term in anime_terms):
+    if any(x in text for x in ("anime", "manga", "waifu", "cel shading", "อนิเมะ", "มังงะ")):
         route = "anime"
-    elif any(term in text for term in design_terms):
+    elif any(x in text for x in ("logo", "brand mark", "icon", "product shot", "packaging", "โลโก้")):
         route = "design"
-    elif any(term in text for term in photo_terms):
+    elif any(x in text for x in ("photo", "photoreal", "portrait", "camera", "lens", "photography", "ภาพถ่าย", "สมจริง")):
         route = "photo"
     else:
         route = "general"
-
     return route, MODEL_ROUTES[route]
 
 
 def enhance_prompt(prompt, style="Auto"):
-    """Expand a short prompt with composition, lighting and quality cues without changing intent."""
     prompt = _normalise_space(prompt)
     if not prompt:
         return ""
-
     additions = []
     preset = STYLE_PRESETS.get(style, "")
     if preset:
         additions.append(preset)
-
     lower = prompt.lower()
-    if not any(word in lower for word in ("composition", "close-up", "wide shot", "portrait", "full body")):
+    if not any(x in lower for x in ("composition", "close-up", "wide shot", "portrait", "full body")):
         additions.append("balanced composition, clear focal subject")
-    if not any(word in lower for word in ("lighting", "sunlight", "golden hour", "neon", "studio light")):
+    if not any(x in lower for x in ("lighting", "sunlight", "golden hour", "neon", "studio light")):
         additions.append("intentional lighting, dimensional shadows")
-    if not any(word in lower for word in ("detailed", "detail", "high quality", "4k", "8k")):
+    if not any(x in lower for x in ("detailed", "detail", "high quality", "4k", "8k")):
         additions.append("highly detailed, high quality")
-
-    if not additions:
-        return prompt
-    return f"{prompt}, " + ", ".join(additions)
+    return prompt if not additions else f"{prompt}, " + ", ".join(additions)
 
 
 def build_negative_prompt(user_negative="", style="Auto"):
-    """Build a negative prompt for provider fallback and future local models that support it."""
     values = list(BASE_NEGATIVE)
     if style == "Product / Logo":
-        values.extend(["busy background", "illegible typography"])
+        values += ["busy background", "illegible typography"]
     elif style == "Photorealistic":
-        values.extend(["plastic skin", "oversmoothed skin", "uncanny face"])
-
-    values.extend(part.strip() for part in (user_negative or "").split(",") if part.strip())
-
-    deduped = []
-    seen = set()
+        values += ["plastic skin", "oversmoothed skin", "uncanny face"]
+    values += [x.strip() for x in (user_negative or "").split(",") if x.strip()]
+    out, seen = [], set()
     for value in values:
         key = value.casefold()
         if key not in seen:
             seen.add(key)
-            deduped.append(value)
-    return ", ".join(deduped)
+            out.append(value)
+    return ", ".join(out)
 
 
 def prepare_generation(prompt, user_negative, style, auto_enhance=True):
@@ -194,276 +118,180 @@ def prepare_generation(prompt, user_negative, style, auto_enhance=True):
         raise gr.Error("Prompt must contain at least 3 characters.")
     if len(prompt) > 2000:
         raise gr.Error("Prompt is too long. Maximum length is 2000 characters.")
-
     final_prompt = enhance_prompt(prompt, style) if auto_enhance else prompt
     final_negative = build_negative_prompt(user_negative, style)
     route, provider_model = route_model(final_prompt, style)
     return final_prompt, final_negative, route, provider_model
 
 
-def preview_prompt(prompt, negative_prompt, style, auto_enhance):
-    final_prompt, final_negative, route, provider_model = prepare_generation(
-        prompt, negative_prompt, style, auto_enhance
-    )
-    local_state = "ready" if LOCAL_PIPELINE is not None else "unavailable"
+def _mode_profile(mode):
+    if mode == "Quality":
+        return {"model": QUALITY_MODEL, "width": 1024, "height": 1024, "steps": 4, "duration": 90}
+    return {"model": FAST_MODEL, "width": 512, "height": 512, "steps": 2, "duration": 45}
+
+
+def _upscale_image(image, upscale):
+    if upscale != "2x Detail Upscale":
+        return image
+    result = image.resize((image.width * 2, image.height * 2), Image.Resampling.LANCZOS)
+    return result.filter(ImageFilter.UnsharpMask(radius=1.2, percent=115, threshold=2))
+
+
+def preview_prompt(prompt, negative_prompt, style, auto_enhance, mode, upscale):
+    final_prompt, final_negative, route, provider_model = prepare_generation(prompt, negative_prompt, style, auto_enhance)
+    profile = _mode_profile(mode)
     info = (
-        f"Primary: `ZeroGPU / {LOCAL_MODEL}` ({local_state}) · "
+        f"Mode: `{mode}` · ZeroGPU primary: `{profile['model']}` · "
+        f"Native: `{profile['width']}x{profile['height']}` · Upscale: `{upscale}` · "
         f"Provider fallback: `{route} / {provider_model}`"
     )
     return final_prompt, final_negative, info
 
 
-def _provider_request(model, prompt, negative_prompt, width, height, steps, guidance, seed):
+def _load_pipeline(mode):
+    global _torch
+    if mode in _PIPELINES:
+        return _PIPELINES[mode]
+    if not IS_HF_SPACE:
+        raise RuntimeError("Local ZeroGPU pipeline is only loaded inside Hugging Face Space")
+    try:
+        import torch
+        from diffusers import DiffusionPipeline
+        _torch = torch
+        profile = _mode_profile(mode)
+        kwargs = {"torch_dtype": torch.float16}
+        if mode == "Fast":
+            kwargs["variant"] = "fp16"
+        pipe = DiffusionPipeline.from_pretrained(profile["model"], **kwargs).to("cuda")
+        pipe.set_progress_bar_config(disable=True)
+        _PIPELINES[mode] = pipe
+        return pipe
+    except Exception as exc:
+        _PIPELINE_ERRORS[mode] = f"{type(exc).__name__}: {exc}"
+        raise
+
+
+def _provider_request(model, prompt, negative_prompt, width, height, steps, seed):
     if provider_client is None:
         raise RuntimeError("HF_TOKEN is not configured, so provider fallback is unavailable")
-
-    adapted_prompt = _adapt_prompt_for_model(prompt, model)
-    try:
-        return provider_client.text_to_image(
-            prompt=adapted_prompt,
-            model=model,
-            negative_prompt=negative_prompt or None,
-            width=int(width),
-            height=int(height),
-            num_inference_steps=int(steps),
-            guidance_scale=float(guidance),
-            seed=seed,
-        )
-    except TypeError:
-        return provider_client.text_to_image(
-            prompt=adapted_prompt,
-            model=model,
-            negative_prompt=negative_prompt or None,
-            seed=seed,
-        )
+    return provider_client.text_to_image(
+        prompt=prompt,
+        model=model,
+        negative_prompt=negative_prompt or None,
+        width=int(width),
+        height=int(height),
+        num_inference_steps=int(steps),
+        seed=seed,
+    )
 
 
-def _generate_provider_fallback(route, selected_model, prompt, negative_prompt, width, height, steps, guidance, seed):
-    """Use the specialist provider model, then FLUX schnell as a final provider fallback."""
-    candidates = [selected_model]
-    if selected_model != DEFAULT_PROVIDER_MODEL:
-        candidates.append(DEFAULT_PROVIDER_MODEL)
-
-    attempts = []
+def _provider_fallback(route, selected_model, prompt, negative_prompt, width, height, steps, seed):
+    candidates = [selected_model] + ([] if selected_model == DEFAULT_PROVIDER_MODEL else [DEFAULT_PROVIDER_MODEL])
+    errors = []
     for model in candidates:
-        started = time.perf_counter()
         try:
-            image = _provider_request(
-                model, prompt, negative_prompt, width, height, steps, guidance, seed
-            )
-            attempts.append({"model": model, "success": True, "seconds": time.perf_counter() - started})
-            return image, model, attempts
+            return _provider_request(model, prompt, negative_prompt, width, height, steps, seed), model
         except Exception as exc:
-            attempts.append(
-                {
-                    "model": model,
-                    "success": False,
-                    "seconds": time.perf_counter() - started,
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            )
+            errors.append(f"{model}: {type(exc).__name__}: {exc}")
             if _is_credit_error(exc):
-                raise gr.Error(
-                    "ZeroGPU generation failed and Hugging Face Inference Provider credits are depleted. "
-                    "Try again later or inspect the ZeroGPU runtime logs."
-                ) from exc
-
-    compact_errors = " | ".join(
-        f"{item['model']}: {item.get('error', 'unknown error')}" for item in attempts if not item["success"]
-    )
-    raise gr.Error(f"ZeroGPU and all provider fallbacks failed. {compact_errors}")
+                raise gr.Error("ZeroGPU failed and Inference Provider credits are depleted.") from exc
+    raise gr.Error("ZeroGPU and provider fallback failed. " + " | ".join(errors))
 
 
-def _local_generation_args(width, height, steps):
-    """Normalize settings for SDXL Turbo's fast local path."""
-    width = int(width)
-    height = int(height)
-    steps = max(1, min(int(steps), 4))
-    return width, height, steps
-
-
-@spaces.GPU(duration=45)
-def generate_image(
-    prompt,
-    negative_prompt,
-    style,
-    auto_enhance,
-    width,
-    height,
-    steps,
-    guidance,
-    seed,
-):
-    """Generate an image on ZeroGPU first and use Inference Providers only if local generation fails."""
-    final_prompt, final_negative, route, provider_model = prepare_generation(
-        prompt, negative_prompt, style, auto_enhance
-    )
+@spaces.GPU(duration=90)
+def generate_image(prompt, negative_prompt, style, auto_enhance, mode, upscale, seed):
+    final_prompt, final_negative, route, provider_model = prepare_generation(prompt, negative_prompt, style, auto_enhance)
+    profile = _mode_profile(mode)
     seed = _normalise_seed(seed)
     started = time.perf_counter()
-
     local_error = None
-    if LOCAL_PIPELINE is not None and _torch is not None:
-        try:
-            local_width, local_height, local_steps = _local_generation_args(width, height, steps)
-            generator = _torch.Generator(device="cuda").manual_seed(seed)
-            image = LOCAL_PIPELINE(
-                prompt=final_prompt,
-                width=local_width,
-                height=local_height,
-                num_inference_steps=local_steps,
-                guidance_scale=0.0,
-                generator=generator,
-            ).images[0]
-            elapsed = round(time.perf_counter() - started, 2)
-            metadata = (
-                f"Backend: `ZeroGPU` · Model: `{LOCAL_MODEL}` · Route intent: `{route}` · "
-                f"Seed: `{seed}` · Steps: `{local_steps}` · Time: `{elapsed}s`"
-            )
-            return image, metadata, final_prompt, final_negative
-        except Exception as exc:
-            local_error = f"{type(exc).__name__}: {exc}"
-    else:
-        local_error = LOCAL_LOAD_ERROR or "local pipeline is not initialized"
 
-    # Local ZeroGPU is primary. Only reach this block if it failed to load or infer.
-    fallback_started = time.perf_counter()
-    image, actual_model, attempts = _generate_provider_fallback(
-        route,
-        provider_model,
-        final_prompt,
-        final_negative,
-        width,
-        height,
-        steps,
-        guidance,
-        seed,
+    try:
+        pipe = _load_pipeline(mode)
+        generator = _torch.Generator(device="cuda").manual_seed(seed)
+        image = pipe(
+            prompt=final_prompt,
+            width=profile["width"],
+            height=profile["height"],
+            num_inference_steps=profile["steps"],
+            guidance_scale=0.0,
+            generator=generator,
+        ).images[0]
+        image = _upscale_image(image, upscale)
+        elapsed = round(time.perf_counter() - started, 2)
+        metadata = (
+            f"Backend: `ZeroGPU` · Mode: `{mode}` · Model: `{profile['model']}` · "
+            f"Output: `{image.width}x{image.height}` · Seed: `{seed}` · Time: `{elapsed}s`"
+        )
+        return image, metadata, final_prompt, final_negative
+    except Exception as exc:
+        local_error = f"{type(exc).__name__}: {exc}"
+
+    image, actual_model = _provider_fallback(
+        route, provider_model, final_prompt, final_negative,
+        profile["width"], profile["height"], profile["steps"], seed,
     )
+    image = _upscale_image(image, upscale)
     elapsed = round(time.perf_counter() - started, 2)
-    fallback_elapsed = round(time.perf_counter() - fallback_started, 2)
     metadata = (
-        f"Backend: `Inference Provider fallback` · Model: `{actual_model}` · Route: `{route}` · "
-        f"Seed: `{seed}` · Total: `{elapsed}s` · Provider time: `{fallback_elapsed}s` · "
-        f"Provider attempts: `{len(attempts)}` · ZeroGPU error: `{local_error}`"
+        f"Backend: `Inference Provider fallback` · Mode: `{mode}` · Model: `{actual_model}` · "
+        f"Output: `{image.width}x{image.height}` · Seed: `{seed}` · Time: `{elapsed}s` · "
+        f"ZeroGPU error: `{local_error}`"
     )
     return image, metadata, final_prompt, final_negative
 
 
 def reset_form():
-    return "", "", "Auto", True, None, "Ready.", "", ""
+    return "", "", "Auto", True, "Fast", "None", -1, None, "Ready.", "", ""
 
 
 CSS = """
-#hero { text-align: center; margin: 8px auto 20px; }
-#hero h1 { font-size: 2.2rem; margin-bottom: 6px; }
-#hero p { opacity: .75; }
-#generate { min-height: 52px; font-size: 1.05rem; font-weight: 700; }
-.preview-box textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+#hero { text-align:center; margin:8px auto 20px; }
+#hero h1 { font-size:2.2rem; margin-bottom:6px; }
+#generate { min-height:52px; font-size:1.05rem; font-weight:700; }
 """
 
 with gr.Blocks(title="Athipan01 AI Image Generator") as demo:
-    gr.Markdown(
-        """
-        <div id="hero">
-          <h1>🎨 Athipan01 AI Image Generator</h1>
-          <p>ZeroGPU-first image generation with intelligent provider fallback</p>
-        </div>
-        """
-    )
-
+    gr.Markdown("""
+    <div id="hero"><h1>🎨 Athipan01 AI Image Generator</h1>
+    <p>Phase 1.7 · Fast / Quality ZeroGPU generation + optional 2x detail upscale</p></div>
+    """)
     with gr.Row():
-        with gr.Column(scale=1):
-            prompt = gr.Textbox(
-                label="Prompt",
-                placeholder="เช่น ผู้หญิงไซเบอร์พังก์เดินในกรุงเทพตอนกลางคืน",
-                lines=6,
-            )
+        with gr.Column():
+            prompt = gr.Textbox(label="Prompt", placeholder="เช่น cinematic Thai cyberpunk warrior", lines=5)
             with gr.Row():
-                style = gr.Dropdown(
-                    choices=list(STYLE_PRESETS.keys()),
-                    value="Auto",
-                    label="Style preset",
-                )
+                style = gr.Dropdown(list(STYLE_PRESETS.keys()), value="Auto", label="Style preset")
                 auto_enhance = gr.Checkbox(value=True, label="✨ Auto Prompt Enhance")
-
-            negative_prompt = gr.Textbox(
-                label="Extra negative prompt (provider fallback)",
-                placeholder="สิ่งที่ไม่ต้องการเพิ่ม เช่น glasses, crowd",
-                lines=2,
-            )
-
-            preview_btn = gr.Button("🧠 Preview AI Prompt")
-            router_info = gr.Markdown("Primary backend: ZeroGPU")
-
-            with gr.Accordion("Advanced Settings", open=False):
-                with gr.Row():
-                    width = gr.Dropdown([512, 768, 1024], value=512, label="Width")
-                    height = gr.Dropdown([512, 768, 1024], value=512, label="Height")
-                with gr.Row():
-                    steps = gr.Slider(1, 12, value=2, step=1, label="Steps (ZeroGPU uses max 4)")
-                    guidance = gr.Slider(0, 15, value=0, step=0.5, label="Guidance (provider fallback)")
-                seed = gr.Number(value=-1, precision=0, label="Seed (-1 = random)")
-
+            negative_prompt = gr.Textbox(label="Extra negative prompt", lines=2)
             with gr.Row():
-                generate_btn = gr.Button("⚡ Generate with ZeroGPU", variant="primary", elem_id="generate")
+                mode = gr.Radio(["Fast", "Quality"], value="Fast", label="Generation mode")
+                upscale = gr.Radio(["None", "2x Detail Upscale"], value="None", label="Post-process")
+            seed = gr.Number(value=-1, precision=0, label="Seed (-1 = random)")
+            preview_btn = gr.Button("🧠 Preview AI Prompt")
+            router_info = gr.Markdown("Fast uses SDXL Turbo. Quality uses SDXL-Lightning.")
+            with gr.Row():
+                generate_btn = gr.Button("✨ Generate", variant="primary", elem_id="generate")
                 clear_btn = gr.Button("Clear")
-
-        with gr.Column(scale=1):
+        with gr.Column():
             output = gr.Image(label="Generated Image", type="pil")
-            status = gr.Markdown("Ready. ZeroGPU is the primary backend.")
+            status = gr.Markdown("Ready.")
             with gr.Accordion("🧠 What the AI sent to the model", open=False):
-                enhanced_preview = gr.Textbox(
-                    label="Enhanced prompt", lines=5, interactive=False, elem_classes=["preview-box"]
-                )
-                negative_preview = gr.Textbox(
-                    label="Final negative prompt", lines=4, interactive=False, elem_classes=["preview-box"]
-                )
-
-    gr.Examples(
-        examples=[
-            ["A Thai floating market in the future at golden hour"],
-            ["A cute astronaut exploring a lush alien jungle"],
-            ["ผู้หญิงไซเบอร์พังก์เดินในกรุงเทพตอนกลางคืน"],
-            ["minimal geometric rabbit logo for streetwear brand"],
-            ["anime swordsman standing in a rainy neon city"],
-        ],
-        inputs=prompt,
-        label="Examples",
-    )
+                enhanced_preview = gr.Textbox(label="Enhanced prompt", lines=5, interactive=False)
+                negative_preview = gr.Textbox(label="Final negative prompt", lines=4, interactive=False)
 
     preview_btn.click(
         preview_prompt,
-        inputs=[prompt, negative_prompt, style, auto_enhance],
+        inputs=[prompt, negative_prompt, style, auto_enhance, mode, upscale],
         outputs=[enhanced_preview, negative_preview, router_info],
     )
-
     generate_btn.click(
         generate_image,
-        inputs=[
-            prompt,
-            negative_prompt,
-            style,
-            auto_enhance,
-            width,
-            height,
-            steps,
-            guidance,
-            seed,
-        ],
+        inputs=[prompt, negative_prompt, style, auto_enhance, mode, upscale, seed],
         outputs=[output, status, enhanced_preview, negative_preview],
     )
-
     clear_btn.click(
         reset_form,
-        outputs=[
-            prompt,
-            negative_prompt,
-            style,
-            auto_enhance,
-            output,
-            status,
-            enhanced_preview,
-            negative_preview,
-        ],
+        outputs=[prompt, negative_prompt, style, auto_enhance, mode, upscale, seed, output, status, enhanced_preview, negative_preview],
     )
 
 if __name__ == "__main__":
