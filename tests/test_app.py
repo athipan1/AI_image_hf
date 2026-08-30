@@ -2,6 +2,7 @@ import importlib
 import os
 
 os.environ.setdefault("HF_TOKEN", "test-token")
+os.environ.pop("SPACE_ID", None)
 
 app = importlib.import_module("app")
 
@@ -42,13 +43,13 @@ def test_negative_prompt_adds_photo_specific_quality_terms():
     assert "uncanny face" in result
 
 
-def test_router_detects_anime():
+def test_router_detects_anime_provider_fallback():
     route, model = app.route_model("anime swordsman in Tokyo", "Auto")
     assert route == "anime"
     assert model == app.MODEL_ROUTES["anime"]
 
 
-def test_router_detects_design():
+def test_router_detects_design_provider_fallback():
     route, model = app.route_model("minimal rabbit logo", "Auto")
     assert route == "design"
     assert model == app.MODEL_ROUTES["design"]
@@ -60,23 +61,27 @@ def test_router_detects_photo_from_style():
     assert model == app.MODEL_ROUTES["photo"]
 
 
-def test_default_specialist_models_are_promoted():
+def test_default_specialist_provider_models_remain_configured():
     assert app.MODEL_ROUTES["photo"] == "black-forest-labs/FLUX.1-Krea-dev"
     assert app.MODEL_ROUTES["anime"] == "falanaja/animefal"
     assert app.MODEL_ROUTES["design"] == "Qwen/Qwen-Image"
 
 
-def test_specialist_route_has_general_fallback():
-    candidates = app._model_candidates("photo", app.MODEL_ROUTES["photo"])
-    assert candidates == [app.MODEL_ROUTES["photo"], app.DEFAULT_MODEL]
+def test_zerogpu_primary_model_is_sdxl_turbo():
+    assert app.LOCAL_MODEL == "stabilityai/sdxl-turbo"
 
 
-def test_general_route_does_not_duplicate_fallback():
-    candidates = app._model_candidates("general", app.DEFAULT_MODEL)
-    assert candidates == [app.DEFAULT_MODEL]
+def test_local_generation_args_cap_turbo_steps():
+    width, height, steps = app._local_generation_args(768, 512, 12)
+    assert (width, height, steps) == (768, 512, 4)
 
 
-def test_anime_model_gets_trigger_word():
+def test_local_generation_args_keep_fast_step_count():
+    width, height, steps = app._local_generation_args(512, 512, 2)
+    assert (width, height, steps) == (512, 512, 2)
+
+
+def test_anime_model_gets_trigger_word_for_provider_fallback():
     prompt = app._adapt_prompt_for_model("swordsman in neon rain", "falanaja/animefal")
     assert prompt.startswith("animefal, ")
 
@@ -91,7 +96,7 @@ def test_credit_error_detection():
     assert not app._is_credit_error(RuntimeError("temporary provider timeout"))
 
 
-def test_prepare_generation_enhances_and_routes():
+def test_prepare_generation_enhances_and_routes_fallback():
     prompt, negative, route, model = app.prepare_generation(
         "minimal coffee logo", "no cup", "Product / Logo", True
     )
@@ -106,3 +111,8 @@ def test_prepare_generation_can_disable_enhancement():
         "simple forest scene", "", "Cinematic", False
     )
     assert prompt == "simple forest scene"
+
+
+def test_ci_does_not_load_large_local_pipeline():
+    assert app.IS_HF_SPACE is False
+    assert app.LOCAL_PIPELINE is None
