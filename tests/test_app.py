@@ -60,6 +60,37 @@ def test_router_detects_photo_from_style():
     assert model == app.MODEL_ROUTES["photo"]
 
 
+def test_default_specialist_models_are_promoted():
+    assert app.MODEL_ROUTES["photo"] == "black-forest-labs/FLUX.1-Krea-dev"
+    assert app.MODEL_ROUTES["anime"] == "falanaja/animefal"
+    assert app.MODEL_ROUTES["design"] == "Qwen/Qwen-Image"
+
+
+def test_specialist_route_has_general_fallback():
+    candidates = app._model_candidates("photo", app.MODEL_ROUTES["photo"])
+    assert candidates == [app.MODEL_ROUTES["photo"], app.DEFAULT_MODEL]
+
+
+def test_general_route_does_not_duplicate_fallback():
+    candidates = app._model_candidates("general", app.DEFAULT_MODEL)
+    assert candidates == [app.DEFAULT_MODEL]
+
+
+def test_anime_model_gets_trigger_word():
+    prompt = app._adapt_prompt_for_model("swordsman in neon rain", "falanaja/animefal")
+    assert prompt.startswith("animefal, ")
+
+
+def test_anime_trigger_is_not_duplicated():
+    prompt = app._adapt_prompt_for_model("animefal, swordsman", "falanaja/animefal")
+    assert prompt == "animefal, swordsman"
+
+
+def test_credit_error_detection():
+    assert app._is_credit_error(RuntimeError("402 Payment Required: depleted credits"))
+    assert not app._is_credit_error(RuntimeError("temporary provider timeout"))
+
+
 def test_prepare_generation_enhances_and_routes():
     prompt, negative, route, model = app.prepare_generation(
         "minimal coffee logo", "no cup", "Product / Logo", True
