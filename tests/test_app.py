@@ -103,6 +103,7 @@ def test_fast_mode_uses_sdxl_turbo_512():
     assert profile["width"] == 512
     assert profile["height"] == 512
     assert profile["steps"] == 2
+    assert profile["duration"] == 55
 
 
 def test_quality_mode_uses_sdxl_lightning_1024():
@@ -111,6 +112,7 @@ def test_quality_mode_uses_sdxl_lightning_1024():
     assert profile["width"] == 1024
     assert profile["height"] == 1024
     assert profile["steps"] == 4
+    assert profile["duration"] == 90
 
 
 def test_auto_mode_uses_ai_recommendation():
@@ -121,7 +123,19 @@ def test_auto_mode_uses_ai_recommendation():
     assert plan["local_model"] == app.QUALITY_MODEL
     assert plan["width"] == 1024
     assert plan["steps"] == 4
+    assert plan["gpu_duration"] == 90
     assert "plastic skin" in negative
+
+
+def test_auto_fast_category_uses_native_turbo_plan():
+    _, _, plan = app.prepare_intelligent_generation(
+        "anime swordsman with cel shading", "", "Auto", True, "Auto"
+    )
+    assert plan["actual_mode"] == "Fast"
+    assert plan["width"] == 512
+    assert plan["height"] == 512
+    assert plan["steps"] == 2
+    assert plan["gpu_duration"] == 55
 
 
 def test_manual_fast_overrides_ai_recommendation():
@@ -152,6 +166,20 @@ def test_credit_error_detection():
     assert not app._is_credit_error(RuntimeError("temporary provider timeout"))
 
 
+def test_zerogpu_error_classification():
+    assert app._classify_zerogpu_error(RuntimeError("ZeroGPU quota exceeded")) == "quota"
+    assert app._classify_zerogpu_error(RuntimeError("request timed out")) == "timeout"
+    assert app._classify_zerogpu_error(RuntimeError("CUDA out of memory")) == "out_of_memory"
+    assert app._classify_zerogpu_error(RuntimeError("checkpoint model load failed")) == "model_load"
+    assert app._classify_zerogpu_error(RuntimeError("unknown crash")) == "runtime"
+
+
+def test_short_error_limits_long_runtime_message():
+    result = app._short_error(RuntimeError("x" * 1000), limit=80)
+    assert len(result) <= 80
+    assert result.endswith("...")
+
+
 def test_prepare_generation_enhances_and_routes_fallback():
     prompt, negative, route, model = app.prepare_generation(
         "minimal coffee logo", "no cup", "Product / Logo", True
@@ -170,7 +198,7 @@ def test_prepare_generation_can_disable_enhancement():
     assert prompt == "simple forest scene"
 
 
-def test_plan_summary_explains_decision():
+def test_plan_summary_explains_decision_and_gpu_budget():
     _, _, plan = app.prepare_intelligent_generation(
         "anime hero character", "", "Anime", True, "Auto"
     )
@@ -178,6 +206,7 @@ def test_plan_summary_explains_decision():
     assert "Category:" in summary
     assert "Confidence:" in summary
     assert "AI-selected" in summary
+    assert "GPU budget:" in summary
     assert "Why:" in summary
 
 
