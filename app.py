@@ -1,3 +1,4 @@
+import gc
 import os
 import random
 import re
@@ -23,6 +24,8 @@ IS_HF_SPACE = bool(os.getenv("SPACE_ID"))
 
 FAST_MODEL = os.getenv("LOCAL_FAST_MODEL", "stabilityai/sdxl-turbo")
 QUALITY_MODEL = os.getenv("LOCAL_QUALITY_MODEL", "ByteDance/SDXL-Lightning")
+QUALITY_BASE_MODEL = os.getenv("LOCAL_QUALITY_BASE_MODEL", "stabilityai/stable-diffusion-xl-base-1.0")
+QUALITY_CHECKPOINT = os.getenv("LOCAL_QUALITY_CHECKPOINT", "sdxl_lightning_4step_unet.safetensors")
 DEFAULT_PROVIDER_MODEL = os.getenv("IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")
 MODEL_ROUTES = {
     "general": os.getenv("IMAGE_MODEL_GENERAL", DEFAULT_PROVIDER_MODEL),
@@ -46,15 +49,12 @@ BASE_NEGATIVE = [
     "low quality", "blurry", "pixelated", "distorted", "deformed", "bad anatomy",
     "extra fingers", "extra limbs", "duplicate subject", "watermark", "unwanted text",
 ]
-
 CATEGORY_RULES = {
     "Photo": (
         "photo", "photoreal", "photorealistic", "portrait", "camera", "lens", "photography",
         "dslr", "bokeh", "ภาพถ่าย", "สมจริง", "พอร์ตเทรต",
     ),
-    "Anime": (
-        "anime", "manga", "waifu", "cel shading", "cel-shaded", "อนิเมะ", "มังงะ",
-    ),
+    "Anime": ("anime", "manga", "waifu", "cel shading", "cel-shaded", "อนิเมะ", "มังงะ"),
     "Design": (
         "poster", "graphic design", "editorial design", "layout", "brochure", "flyer",
         "typography", "infographic", "โปสเตอร์", "กราฟิก",
@@ -67,11 +67,8 @@ CATEGORY_RULES = {
         "character", "character sheet", "game character", "hero", "villain", "warrior",
         "full body", "concept character", "ตัวละคร", "คาแรกเตอร์", "นักรบ",
     ),
-    "Logo": (
-        "logo", "brand mark", "logomark", "emblem", "mascot logo", "icon mark", "โลโก้", "ตราสัญลักษณ์",
-    ),
+    "Logo": ("logo", "brand mark", "logomark", "emblem", "mascot logo", "icon mark", "โลโก้", "ตราสัญลักษณ์"),
 }
-
 CATEGORY_NEGATIVES = {
     "Photo": ["plastic skin", "oversmoothed skin", "uncanny face", "cgi look", "cartoon"],
     "Anime": ["photorealistic skin", "messy line art", "muddy colors", "inconsistent eyes"],
@@ -80,11 +77,10 @@ CATEGORY_NEGATIVES = {
     "Character": ["bad hands", "asymmetrical eyes", "broken pose", "cropped feet", "duplicate character"],
     "Logo": ["photorealistic", "3d mockup", "busy background", "illegible typography", "complex tiny details"],
 }
-
 CATEGORY_CONFIG = {
     "Photo": {"route": "photo", "mode": "Quality", "width": 1024, "height": 1024, "steps": 4},
-    "Anime": {"route": "anime", "mode": "Fast", "width": 768, "height": 768, "steps": 3},
-    "Design": {"route": "design", "mode": "Fast", "width": 768, "height": 768, "steps": 3},
+    "Anime": {"route": "anime", "mode": "Fast", "width": 512, "height": 512, "steps": 2},
+    "Design": {"route": "design", "mode": "Fast", "width": 512, "height": 512, "steps": 2},
     "Product": {"route": "product", "mode": "Quality", "width": 1024, "height": 1024, "steps": 4},
     "Character": {"route": "character", "mode": "Quality", "width": 1024, "height": 1024, "steps": 4},
     "Logo": {"route": "logo", "mode": "Quality", "width": 1024, "height": 1024, "steps": 4},
@@ -112,11 +108,28 @@ def _is_credit_error(exc):
     return "402" in text or "payment required" in text or ("depleted" in text and "credits" in text)
 
 
+def _classify_zerogpu_error(exc):
+    text = str(exc).lower()
+    if any(token in text for token in ("quota", "gpu quota", "exceeded your gpu", "not enough gpu time")):
+        return "quota"
+    if any(token in text for token in ("timeout", "timed out", "deadline exceeded")):
+        return "timeout"
+    if any(token in text for token in ("cuda out of memory", "outofmemoryerror", "out of memory")):
+        return "out_of_memory"
+    if any(token in text for token in ("from_pretrained", "checkpoint", "safetensors", "model load")):
+        return "model_load"
+    return "runtime"
+
+
+def _short_error(exc, limit=260):
+    text = _normalise_space(f"{type(exc).__name__}: {exc}")
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
 def analyze_prompt(prompt, style="Auto"):
     text = f"{prompt or ''} {style or ''}".lower()
     scores = {category: 0 for category in CATEGORY_RULES}
     evidence = {category: [] for category in CATEGORY_RULES}
-
     for category, keywords in CATEGORY_RULES.items():
         for keyword in keywords:
             if keyword in text:
@@ -138,9 +151,7 @@ def analyze_prompt(prompt, style="Auto"):
     top_category, top_score = ranked[0]
     second_score = ranked[1][1]
     if top_score <= 0:
-        category = "General"
-        confidence = 0.45
-        reasons = ["no strong specialist signal"]
+        category, confidence, reasons = "General", 0.45, ["no strong specialist signal"]
     else:
         category = top_category
         margin = top_score - second_score
@@ -225,6 +236,12 @@ def prepare_generation(prompt, user_negative, style, auto_enhance=True):
     return final_prompt, final_negative, plan["route"], plan["provider_model"]
 
 
+def _mode_profile(mode):
+    if mode == "Quality":
+        return {"model": QUALITY_MODEL, "width": 1024, "height": 1024, "steps": 4, "duration": 90}
+    return {"model": FAST_MODEL, "width": 512, "height": 512, "steps": 2, "duration": 55}
+
+
 def prepare_intelligent_generation(prompt, user_negative, style, auto_enhance, requested_mode="Auto"):
     prompt = _normalise_space(prompt)
     if len(prompt) < 3:
@@ -239,16 +256,13 @@ def prepare_intelligent_generation(prompt, user_negative, style, auto_enhance, r
     plan = dict(plan)
     plan["actual_mode"] = actual_mode
     plan["local_model"] = profile["model"]
-    plan["width"] = profile["width"] if requested_mode != "Auto" else plan["width"]
-    plan["height"] = profile["height"] if requested_mode != "Auto" else plan["height"]
-    plan["steps"] = profile["steps"] if requested_mode != "Auto" else plan["steps"]
+    plan["gpu_duration"] = profile["duration"]
+    # Local distilled models are most reliable at their native resolution/step count.
+    # Provider fallback receives the same safe plan instead of an expensive oversized request.
+    plan["width"] = profile["width"]
+    plan["height"] = profile["height"]
+    plan["steps"] = profile["steps"]
     return final_prompt, final_negative, plan
-
-
-def _mode_profile(mode):
-    if mode == "Quality":
-        return {"model": QUALITY_MODEL, "width": 1024, "height": 1024, "steps": 4, "duration": 90}
-    return {"model": FAST_MODEL, "width": 512, "height": 512, "steps": 2, "duration": 45}
 
 
 def _upscale_image(image, upscale):
@@ -264,8 +278,8 @@ def _plan_summary(plan, requested_mode, upscale):
         f"Category: `{plan['category']}` · Confidence: `{plan['confidence']:.0%}` · "
         f"Mode: `{plan['actual_mode']}` ({'AI-selected' if requested_mode == 'Auto' else 'manual override'}) · "
         f"ZeroGPU: `{plan['local_model']}` · Resolution: `{plan['width']}x{plan['height']}` · "
-        f"Steps: `{plan['steps']}` · Provider fallback: `{plan['route']} / {plan['provider_model']}` · "
-        f"Why: `{reasons}` · Upscale: `{upscale}`"
+        f"Steps: `{plan['steps']}` · GPU budget: `{plan['gpu_duration']}s` · "
+        f"Provider fallback: `{plan['route']} / {plan['provider_model']}` · Why: `{reasons}` · Upscale: `{upscale}`"
     )
 
 
@@ -276,27 +290,88 @@ def preview_prompt(prompt, negative_prompt, style, auto_enhance, mode, upscale):
     return final_prompt, final_negative, _plan_summary(plan, mode, upscale)
 
 
+def _evict_other_pipelines(mode):
+    global _PIPELINES
+    for key in list(_PIPELINES):
+        if key != mode:
+            del _PIPELINES[key]
+    gc.collect()
+
+
 def _load_pipeline(mode):
     global _torch
     if mode in _PIPELINES:
         return _PIPELINES[mode]
     if not IS_HF_SPACE:
         raise RuntimeError("Local ZeroGPU pipeline is only loaded inside Hugging Face Space")
+
+    _evict_other_pipelines(mode)
     try:
         import torch
-        from diffusers import DiffusionPipeline
         _torch = torch
-        profile = _mode_profile(mode)
-        kwargs = {"torch_dtype": torch.float16}
-        if mode == "Fast":
-            kwargs["variant"] = "fp16"
-        pipe = DiffusionPipeline.from_pretrained(profile["model"], **kwargs).to("cuda")
+        if mode == "Quality":
+            from diffusers import EulerDiscreteScheduler, StableDiffusionXLPipeline, UNet2DConditionModel
+            from huggingface_hub import hf_hub_download
+            from safetensors.torch import load_file
+
+            unet = UNet2DConditionModel.from_config(QUALITY_BASE_MODEL, subfolder="unet")
+            checkpoint = hf_hub_download(QUALITY_MODEL, QUALITY_CHECKPOINT)
+            unet.load_state_dict(load_file(checkpoint, device="cpu"))
+            pipe = StableDiffusionXLPipeline.from_pretrained(
+                QUALITY_BASE_MODEL,
+                unet=unet,
+                torch_dtype=torch.float16,
+                variant="fp16",
+            )
+            pipe.scheduler = EulerDiscreteScheduler.from_config(
+                pipe.scheduler.config,
+                timestep_spacing="trailing",
+            )
+        else:
+            from diffusers import DiffusionPipeline
+            pipe = DiffusionPipeline.from_pretrained(
+                FAST_MODEL,
+                torch_dtype=torch.float16,
+                variant="fp16",
+            )
         pipe.set_progress_bar_config(disable=True)
         _PIPELINES[mode] = pipe
+        _PIPELINE_ERRORS.pop(mode, None)
         return pipe
     except Exception as exc:
-        _PIPELINE_ERRORS[mode] = f"{type(exc).__name__}: {exc}"
+        _PIPELINE_ERRORS[mode] = _short_error(exc)
         raise
+
+
+def _run_local_inference(mode, prompt, width, height, steps, seed):
+    pipe = _PIPELINES.get(mode)
+    if pipe is None:
+        raise RuntimeError(f"{mode} pipeline was not prepared before GPU allocation")
+    pipe.to("cuda")
+    try:
+        generator = _torch.Generator(device="cuda").manual_seed(seed)
+        return pipe(
+            prompt=prompt,
+            width=int(width),
+            height=int(height),
+            num_inference_steps=int(steps),
+            guidance_scale=0.0,
+            generator=generator,
+        ).images[0]
+    finally:
+        pipe.to("cpu")
+        if _torch.cuda.is_available():
+            _torch.cuda.empty_cache()
+
+
+@spaces.GPU(duration=55)
+def _generate_fast_gpu(prompt, width, height, steps, seed):
+    return _run_local_inference("Fast", prompt, width, height, steps, seed)
+
+
+@spaces.GPU(duration=90)
+def _generate_quality_gpu(prompt, width, height, steps, seed):
+    return _run_local_inference("Quality", prompt, width, height, steps, seed)
 
 
 def _provider_request(model, prompt, negative_prompt, width, height, steps, seed):
@@ -313,20 +388,25 @@ def _provider_request(model, prompt, negative_prompt, width, height, steps, seed
     )
 
 
-def _provider_fallback(route, selected_model, prompt, negative_prompt, width, height, steps, seed):
+def _provider_fallback(route, selected_model, prompt, negative_prompt, width, height, steps, seed, local_error=None):
     candidates = [selected_model] + ([] if selected_model == DEFAULT_PROVIDER_MODEL else [DEFAULT_PROVIDER_MODEL])
     errors = []
     for model in candidates:
         try:
             return _provider_request(model, prompt, negative_prompt, width, height, steps, seed), model
         except Exception as exc:
-            errors.append(f"{model}: {type(exc).__name__}: {exc}")
+            errors.append(_short_error(exc))
             if _is_credit_error(exc):
-                raise gr.Error("ZeroGPU failed and Inference Provider credits are depleted.") from exc
-    raise gr.Error("ZeroGPU and provider fallback failed. " + " | ".join(errors))
+                local_text = local_error or "unknown ZeroGPU failure"
+                raise gr.Error(
+                    f"ZeroGPU failed ({local_text}). Provider fallback is unavailable because credits are depleted."
+                ) from exc
+    local_text = local_error or "unknown ZeroGPU failure"
+    raise gr.Error(
+        f"ZeroGPU failed ({local_text}). Provider fallback also failed: " + " | ".join(errors)
+    )
 
 
-@spaces.GPU(duration=90)
 def generate_image(prompt, negative_prompt, style, auto_enhance, mode, upscale, seed):
     final_prompt, final_negative, plan = prepare_intelligent_generation(
         prompt, negative_prompt, style, auto_enhance, mode
@@ -336,30 +416,27 @@ def generate_image(prompt, negative_prompt, style, auto_enhance, mode, upscale, 
     local_error = None
 
     try:
-        pipe = _load_pipeline(plan["actual_mode"])
-        generator = _torch.Generator(device="cuda").manual_seed(seed)
-        image = pipe(
-            prompt=final_prompt,
-            width=plan["width"],
-            height=plan["height"],
-            num_inference_steps=plan["steps"],
-            guidance_scale=0.0,
-            generator=generator,
-        ).images[0]
+        # Prepare/download on CPU first. GPU quota starts only in the mode-specific decorated call.
+        _load_pipeline(plan["actual_mode"])
+        if plan["actual_mode"] == "Quality":
+            image = _generate_quality_gpu(final_prompt, plan["width"], plan["height"], plan["steps"], seed)
+        else:
+            image = _generate_fast_gpu(final_prompt, plan["width"], plan["height"], plan["steps"], seed)
         image = _upscale_image(image, upscale)
         elapsed = round(time.perf_counter() - started, 2)
         metadata = (
             f"Backend: `ZeroGPU` · Category: `{plan['category']}` · Confidence: `{plan['confidence']:.0%}` · "
             f"Mode: `{plan['actual_mode']}` · Model: `{plan['local_model']}` · "
-            f"Output: `{image.width}x{image.height}` · Steps: `{plan['steps']}` · Seed: `{seed}` · Time: `{elapsed}s`"
+            f"Output: `{image.width}x{image.height}` · Steps: `{plan['steps']}` · "
+            f"GPU budget: `{plan['gpu_duration']}s` · Seed: `{seed}` · Time: `{elapsed}s`"
         )
         return image, metadata, final_prompt, final_negative
     except Exception as exc:
-        local_error = f"{type(exc).__name__}: {exc}"
+        local_error = f"{_classify_zerogpu_error(exc)}: {_short_error(exc)}"
 
     image, actual_model = _provider_fallback(
         plan["route"], plan["provider_model"], final_prompt, final_negative,
-        plan["width"], plan["height"], plan["steps"], seed,
+        plan["width"], plan["height"], plan["steps"], seed, local_error=local_error,
     )
     image = _upscale_image(image, upscale)
     elapsed = round(time.perf_counter() - started, 2)
